@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0.0
 // @description  一键导出特定知乎用户的所有回答和文章为 Markdown 文件（保存到文件夹）
-// @author       GitHub Copilot
+// @author       残阳血
 // @match        *://www.zhihu.com/people/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/turndown/7.1.3/turndown.min.js
 // @grant        GM_download
