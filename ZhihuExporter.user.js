@@ -1,13 +1,16 @@
 // ==UserScript==
 // @name         知乎主页一键导出工具 (Zhihu Exporter)
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  一键导出特定知乎用户的所有回答和文章为 Markdown 文件（保存到文件夹）
 // @author       残阳血
 // @match        *://www.zhihu.com/people/*
 // @require      https://cdnjs.cloudflare.com/ajax/libs/turndown/7.1.3/turndown.min.js
 // @grant        GM_download
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      www.zhihu.com
+// @connect      zhuanlan.zhihu.com
 // ==/UserScript==
 
 (function() {
@@ -164,6 +167,56 @@
         }
     }
 
+    function buildListApiUrl({ urlToken, type, offset, limit }) {
+        const parsed = new URL(`https://www.zhihu.com/api/v4/members/${urlToken}/${type}`);
+        parsed.searchParams.set('offset', String(offset));
+        parsed.searchParams.set('limit', String(limit));
+
+        // 列表接口已不稳定返回正文字段，显式声明 include 以提高命中率。
+        const include = type === 'answers'
+            ? 'data[*].content,data[*].created_time,data[*].question.title,data[*].question.id'
+            : 'data[*].title,data[*].content,data[*].created';
+        parsed.searchParams.set('include', include);
+        return parsed.toString();
+    }
+
+    function hasFullContent(item) {
+        if (!item) return false;
+        if (typeof item.content === 'string' && item.content.trim()) return true;
+        return false;
+    }
+
+    async function hydrateItemDetailIfNeeded(type, item) {
+        if (hasFullContent(item)) return item;
+        if (!item || item.id === undefined || item.id === null) return item;
+
+        const id = String(item.id);
+        const detailUrl = type === 'answers'
+            ? `https://www.zhihu.com/api/v4/answers/${id}?include=content,created_time,question.title,question.id`
+            : `https://www.zhihu.com/api/v4/articles/${id}?include=title,content,created`;
+
+        try {
+            const detail = await requestJson(detailUrl, 1);
+            return {
+                ...item,
+                ...detail,
+                question: detail?.question || item?.question
+            };
+        } catch (error) {
+            // 文章详情 API 常见 403，回退抓取专栏页面正文。
+            if (type === 'articles' && (error.status === 401 || error.status === 403)) {
+                const pageDetail = await fetchArticleDetailFromPage(id);
+                if (pageDetail && hasFullContent(pageDetail)) {
+                    return {
+                        ...item,
+                        ...pageDetail
+                    };
+                }
+            }
+            throw error;
+        }
+    }
+
     async function requestJson(url, retries = 2) {
         const normalizedUrl = normalizeApiUrl(url);
         for (let attempt = 0; attempt <= retries; attempt++) {
@@ -198,6 +251,138 @@
         }
     }
 
+    async function requestText(url, retries = 1) {
+        const normalizedUrl = normalizeApiUrl(url);
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                if (typeof GM_xmlhttpRequest === 'function') {
+                    const html = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: 'GET',
+                            url: normalizedUrl,
+                            anonymous: false,
+                            timeout: 20000,
+                            headers: {
+                                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                            },
+                            onload: (resp) => {
+                                if (resp.status >= 200 && resp.status < 300) {
+                                    resolve(resp.responseText || '');
+                                    return;
+                                }
+                                const httpErr = new Error(`HTTP_${resp.status}`);
+                                httpErr.status = resp.status;
+                                reject(httpErr);
+                            },
+                            onerror: () => reject(new Error('NETWORK_ERROR')),
+                            ontimeout: () => reject(new Error('TIMEOUT'))
+                        });
+                    });
+                    return html;
+                }
+
+                const resp = await fetch(normalizedUrl, {
+                    method: 'GET',
+                    credentials: 'include'
+                });
+                if (!resp.ok) {
+                    const httpErr = new Error(`HTTP_${resp.status}`);
+                    httpErr.status = resp.status;
+                    throw httpErr;
+                }
+                return await resp.text();
+            } catch (error) {
+                const isLast = attempt >= retries;
+                const retryable = !error.status || error.status >= 500;
+                if (isLast || !retryable) throw error;
+                await sleep(randomDelay(900, 1600));
+            }
+        }
+    }
+
+    function parseJsonSafe(text) {
+        if (!text || typeof text !== 'string') return null;
+        try {
+            return JSON.parse(text);
+        } catch {
+            return null;
+        }
+    }
+
+    function findNodeByIdWithContent(root, targetId) {
+        if (!root || typeof root !== 'object') return null;
+        const stack = [root];
+        const seen = new Set();
+
+        while (stack.length) {
+            const current = stack.pop();
+            if (!current || typeof current !== 'object') continue;
+            if (seen.has(current)) continue;
+            seen.add(current);
+
+            const currentId = current.id ?? current.articleId;
+            if (currentId !== undefined && currentId !== null) {
+                if (String(currentId) === targetId && typeof current.content === 'string' && current.content.trim()) {
+                    return current;
+                }
+            }
+
+            for (const value of Object.values(current)) {
+                if (value && typeof value === 'object') {
+                    stack.push(value);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function parsePublishedTimeFromDoc(doc) {
+        const published = doc.querySelector('meta[itemprop="datePublished"]')?.getAttribute('content') || '';
+        if (!published) return 0;
+        const ms = Date.parse(published);
+        return Number.isNaN(ms) ? 0 : Math.floor(ms / 1000);
+    }
+
+    function parseArticleFromHtml(html, articleId) {
+        if (!html) return null;
+
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const titleFromDom = (doc.querySelector('h1.Post-Title')?.textContent || doc.querySelector('h1')?.textContent || '').trim();
+
+        const initialDataScript = doc.querySelector('#js-initialData');
+        if (initialDataScript && initialDataScript.textContent) {
+            const data = parseJsonSafe(initialDataScript.textContent.trim());
+            const articleNode = findNodeByIdWithContent(data, String(articleId));
+            if (articleNode) {
+                return {
+                    id: articleId,
+                    title: articleNode.title || titleFromDom,
+                    content: articleNode.content,
+                    created: articleNode.created || articleNode.created_time || articleNode.createdTime || parsePublishedTimeFromDoc(doc)
+                };
+            }
+        }
+
+        const richNode = doc.querySelector('.Post-RichTextContainer .RichText, .Post-RichText .RichText, .RichContent-inner .RichText, .RichText.ztext');
+        if (richNode && typeof richNode.innerHTML === 'string' && richNode.innerHTML.trim()) {
+            return {
+                id: articleId,
+                title: titleFromDom,
+                content: richNode.innerHTML,
+                created: parsePublishedTimeFromDoc(doc)
+            };
+        }
+
+        return null;
+    }
+
+    async function fetchArticleDetailFromPage(articleId) {
+        const pageUrl = `https://zhuanlan.zhihu.com/p/${articleId}`;
+        const html = await requestText(pageUrl, 1);
+        return parseArticleFromHtml(html, articleId);
+    }
+
     function buildUniqueId(type, item) {
         const hasId = item && item.id !== undefined && item.id !== null;
         return hasId
@@ -207,7 +392,7 @@
 
     async function saveItemAsMarkdown({ item, type, turndown, dirHandle, folderName, usedFileNames }) {
         const title = cleanTitle(item);
-        const content = item.content || '';
+        const content = item.content || item.excerpt || item.description || '';
         const createdTime = item.created_time || item.created || 0;
         const hasId = item && item.id !== undefined && item.id !== null;
         const articleUrl = (type === 'answers')
@@ -230,7 +415,12 @@
 
     async function collectPages({ urlToken, type, progressPrefix }) {
         const limit = 20;
-        let nextUrl = `https://www.zhihu.com/api/v4/members/${urlToken}/${type}?offset=0&limit=${limit}`;
+        let nextUrl = buildListApiUrl({
+            urlToken,
+            type,
+            offset: 0,
+            limit
+        });
         const allItems = [];
         const seenIds = new Set();
         let apiTotal = 0;
@@ -303,9 +493,17 @@
             });
 
             let savedCount = 0;
+            let partialCount = 0;
             for (let index = 0; index < result.items.length; index++) {
-                const item = result.items[index];
+                let item = result.items[index];
                 progressEl.innerText = `正在保存 ${index + 1}/${result.items.length}...`;
+
+                try {
+                    item = await hydrateItemDetailIfNeeded(type, item);
+                } catch (detailErr) {
+                    // 单条详情失败时继续导出，避免整批中断。
+                    console.warn('hydrate detail failed:', item?.id, detailErr);
+                }
 
                 await saveItemAsMarkdown({
                     item,
@@ -315,6 +513,9 @@
                     folderName,
                     usedFileNames
                 });
+                if (!hasFullContent(item)) {
+                    partialCount++;
+                }
                 savedCount++;
 
                 const saveDelay = randomDelay(180, 380);
@@ -324,7 +525,8 @@
             statusEl.innerText = '导出完成';
             statusEl.style.color = '#258d19';
             const totalText = result.apiTotal ? `（页面显示 ${result.apiTotal}）` : '';
-            progressEl.innerText = `已导出 ${savedCount} 篇可访问${typeLabel}${totalText}。`; 
+            const partialText = partialCount ? `，其中 ${partialCount} 篇仅导出摘要（访问受限）` : '';
+            progressEl.innerText = `已导出 ${savedCount} 篇可访问${typeLabel}${totalText}${partialText}。`; 
 
         } catch (err) {
             console.error(err);
